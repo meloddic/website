@@ -1,0 +1,17 @@
+
+name: Schedule Trigger Test
+
+on:
+  schedule:
+    - cron: '17,37,57 * * * *'
+  workflow_dispatch:
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record scheduled execution
+        run: |
+          echo "GitHub scheduled workflow triggered."
+          echo "UTC time: $(date -u)"
+          echo "Event: ${{ github.event_name }}"
