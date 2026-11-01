@@ -1,0 +1,195 @@
+
+name: Scheduled Website Publishing
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish the scheduled draft immediately'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: website-publishing
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Retrieve the public website repository
+      - name: Checkout website
+        uses: actions/checkout@v4
+
+      # Retrieve the private drafts repository
+      - name: Checkout private drafts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/website-drafts
+          token: ${{ secrets.DRAFTS_TOKEN }}
+          path: private-drafts
+
+      # Check the schedule and prepare the website
+      - name: Check publication schedule
+        id: prepare
+        env:
+          FORCE_PUBLISH: ${{ github.event.inputs.force }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const root = process.env.GITHUB_WORKSPACE;
+          const drafts = path.join(root, 'private-drafts');
+          const scheduleFile = path.join(drafts, 'schedule.json');
+          const marker = path.join(root, '.github', 'published-update');
+          const output = process.env.GITHUB_OUTPUT;
+
+          function setOutput(name, value) {
+            fs.appendFileSync(output, `${name}=${value}\n`);
+          }
+
+          if (!fs.existsSync(scheduleFile)) {
+            throw new Error('schedule.json was not found.');
+          }
+
+          const schedule = JSON.parse(
+            fs.readFileSync(scheduleFile, 'utf8')
+          );
+
+          if (
+            typeof schedule.id !== 'string' ||
+            !schedule.id.trim() ||
+            typeof schedule.path !== 'string' ||
+            !schedule.path.startsWith('drafts/')
+          ) {
+            throw new Error('Invalid schedule configuration.');
+          }
+
+          const parts = schedule.path.split('/');
+
+          if (parts.some(part => !part || part === '.' || part === '..')) {
+            throw new Error('Invalid draft path.');
+          }
+
+          const publishTime = Date.parse(schedule.publish_at);
+
+          if (!Number.isFinite(publishTime)) {
+            throw new Error('Invalid publication date.');
+          }
+
+          const previousId = fs.existsSync(marker)
+            ? fs.readFileSync(marker, 'utf8').trim()
+            : '';
+
+          const force = process.env.FORCE_PUBLISH === 'true';
+          const alreadyPublished = previousId === schedule.id;
+          const isDue = Date.now() >= publishTime;
+
+          const site = path.join(root, '_site');
+
+          function prepareSite(source) {
+            fs.rmSync(site, { recursive: true, force: true });
+            fs.mkdirSync(site, { recursive: true });
+            fs.cpSync(source, site, { recursive: true });
+
+            if (!fs.existsSync(path.join(site, 'index.html'))) {
+              throw new Error('The website draft needs an index.html file.');
+            }
+          }
+
+          if (alreadyPublished) {
+            console.log('This update has already been published.');
+            setOutput('deploy', 'false');
+            setOutput('mark', 'false');
+
+          } else if (force || isDue) {
+            const draft = path.resolve(root, 'private-drafts', schedule.path);
+            const privateRoot = path.resolve(drafts);
+
+            if (!draft.startsWith(privateRoot + path.sep)) {
+              throw new Error('Draft path is outside the drafts repository.');
+            }
+
+            if (!fs.existsSync(draft) || !fs.statSync(draft).isDirectory()) {
+              throw new Error('The scheduled draft folder does not exist.');
+            }
+
+            prepareSite(draft);
+
+            console.log('Preparing scheduled website update.');
+            setOutput('deploy', 'true');
+            setOutput('mark', 'true');
+
+          } else if (
+            process.env.EVENT_NAME === 'workflow_dispatch' &&
+            !previousId
+          ) {
+            // First manual run: publish the existing basic website.
+            const currentSite = path.join(root, 'current-site');
+            fs.mkdirSync(currentSite, { recursive: true });
+
+            for (const file of ['index.html', 'styles.css']) {
+              const source = path.join(root, file);
+
+              if (fs.existsSync(source)) {
+                fs.copyFileSync(source, path.join(currentSite, file));
+              }
+            }
+
+            prepareSite(currentSite);
+
+            console.log('Preparing initial website deployment.');
+            setOutput('deploy', 'true');
+            setOutput('mark', 'false');
+
+          } else {
+            console.log('No publication is due yet.');
+            setOutput('deploy', 'false');
+            setOutput('mark', 'false');
+          }
+
+          setOutput('update_id', schedule.id);
+          NODE
+
+      # Configure GitHub Pages
+      - name: Configure GitHub Pages
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/configure-pages@v5
+
+      # Upload the prepared website
+      - name: Upload website
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      # Deploy the website
+      - name: Deploy to GitHub Pages
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/deploy-pages@v4
+
+      # Record successful publication
+      - name: Record published update
+        if: steps.prepare.outputs.mark == 'true'
+        env:
+          PUBLISHED_ID: ${{ steps.prepare.outputs.update_id }}
+        run: |
+          mkdir -p .github
+          printf '%s\n' "$PUBLISHED_ID" > .github/published-update
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .github/published-update
