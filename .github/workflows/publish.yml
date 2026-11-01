@@ -163,6 +163,42 @@ jobs:
           setOutput('update_id', schedule.id);
           NODE
 
+      # Encrypt private HTML pages
+      - name: Encrypt private pages
+        if: steps.prepare.outputs.deploy == 'true'
+        env:
+          STATICRYPT_PASSWORD: ${{ secrets.WEBSITE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -f "_site/private.html" ]; then
+            npx --yes staticrypt@3.5.6 \
+              "_site/private.html" \
+              --remember 14 \
+              --config .staticrypt.json \
+              --directory "_site/encrypted"
+
+            test -s "_site/encrypted/private.html"
+
+            if grep -Fq "Welcome to the private area!" "_site/encrypted/private.html"; then
+              echo "ERROR: Private text is still visible."
+              exit 1
+            fi
+
+            mv "_site/encrypted/private.html" "_site/private.html"
+            rm -rf "_site/encrypted"
+
+            # Check that no unencrypted private text remains
+            if grep -R -Fq "Welcome to the private area!" "_site"; then
+              echo "ERROR: Unencrypted private content detected."
+              exit 1
+            fi
+
+            echo "Private page encrypted successfully."
+          else
+            echo "No private page found; nothing to encrypt."
+          fi
+
       # Configure GitHub Pages
       - name: Configure GitHub Pages
         if: steps.prepare.outputs.deploy == 'true'
